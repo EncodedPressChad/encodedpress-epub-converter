@@ -153,7 +153,46 @@ def create_cover_pdf(cover_image_path, output_path, page_width_in=5.5, page_heig
     return output_path
 
 
-def build_combined_html(spine, opf_dir):
+def is_cover_page(html_path, item):
+    """Detect if a spine item is a cover page that wraps the cover image.
+
+    Many EPUBs include a cover.xhtml that simply wraps the cover image in
+    an HTML page. When we've already generated a full-bleed cover PDF,
+    including this page results in a duplicate (poorly-formatted) cover.
+
+    Detection heuristics:
+    - The item ID or href contains 'cover'
+    - The HTML body is very small and contains just an <img> tag
+    - The body has a 'cover' class
+    """
+    href_lower = item.get('href', '').lower()
+    # Check if filename/id suggests a cover page
+    if 'cover' not in os.path.basename(href_lower):
+        return False
+
+    # Read and verify it's just wrapping an image
+    try:
+        with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        body_match = re.search(r'<body[^>]*>(.*?)</body>', content, re.DOTALL | re.IGNORECASE)
+        if body_match:
+            body = body_match.group(1).strip()
+            # A cover page typically has minimal content: just a div with an img
+            text_content = re.sub(r'<[^>]+>', '', body).strip()
+            has_img = bool(re.search(r'<img\s', body, re.IGNORECASE))
+            # If body text is very short (just whitespace/alt text) and has an image
+            if has_img and len(text_content) < 100:
+                return True
+        # Also check for body class="cover"
+        if re.search(r'<body[^>]*class="[^"]*cover[^"]*"', content, re.IGNORECASE):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def build_combined_html(spine, opf_dir, skip_cover=False):
     """Combine all spine chapters into a single HTML document.
 
     This ensures that internal links (e.g., TOC links to chapter-001.xhtml)
@@ -163,14 +202,27 @@ def build_combined_html(spine, opf_dir):
     IMPORTANT: The output must be saved as .html (not .xhtml) to avoid
     Chromium's strict XHTML parser which silently fails on EPUB namespace
     attributes, resulting in an empty body and broken pagination.
+
+    Args:
+        spine: List of spine items from the OPF.
+        opf_dir: Directory containing the OPF and content files.
+        skip_cover: If True, detect and skip cover HTML pages from the spine
+                    (to avoid duplicating the generated full-bleed cover).
     """
     # Collect all CSS files referenced by any chapter
     all_css = set()
     all_bodies = []
+    skipped_cover = False
 
     for i, item in enumerate(spine):
         html_path = item['full_path']
         if not os.path.exists(html_path):
+            continue
+
+        # Skip cover HTML pages when we've generated our own cover PDF
+        if skip_cover and not skipped_cover and is_cover_page(html_path, item):
+            skipped_cover = True
+            print(f"    Skipping cover page: {os.path.basename(item['href'])} (already generated full-bleed cover)")
             continue
 
         with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -355,7 +407,8 @@ def epub_to_pdf(epub_path, pdf_path=None):
 
         # Step 4: Combine all chapters into single HTML
         print("Step 4: Combining chapters into single HTML...")
-        combined_html_path = build_combined_html(spine, opf_dir)
+        has_cover = cover_pdf_path is not None
+        combined_html_path = build_combined_html(spine, opf_dir, skip_cover=has_cover)
         print(f"  Combined {len(spine)} chapters")
         print(f"  Internal TOC links rewritten to anchors")
         print()
